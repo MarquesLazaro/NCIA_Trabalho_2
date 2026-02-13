@@ -60,6 +60,25 @@ Este projeto utiliza **Taskipy** para gerenciar tarefas comuns de desenvolviment
     task fix
     ```
 
+## 🤝 Workflow e Branches
+
+Para manter a organização e evitar conflitos, cada membro da equipe deve trabalhar em sua própria branch antes de enviar código para a `main`.
+
+### Branches Ativas
+
+*   **`main`**: Código estável e versão de produção.
+*   **`lazaro`**: Branch de desenvolvimento do Lazaro.
+*   **`giovana`**: Branch de desenvolvimento da Giovana.
+*   **`alef`**: Branch de desenvolvimento do Alef.
+
+### Fluxo de Trabalho Recomendado
+
+1.  Mude para sua branch: `git checkout <seu-nome>`
+2.  Faça suas alterações e commits.
+3.  Atualize sua branch com a main: `git merge main` (para resolver conflitos localmente).
+4.  Envie para o remoto: `git push origin <seu-nome>`
+5.  Abra um **Pull Request (PR)** no GitHub da sua branch para a `main`.
+
 ## 🧩 Tecnologias
 
 *   **Python 3.10+**
