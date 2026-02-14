@@ -1,4 +1,4 @@
-def min_max_scale(spec):
+def min_max_scaler(spec):
     min_val = spec.min()
     max_val = spec.max()
 
