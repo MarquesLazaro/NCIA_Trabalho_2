@@ -60,6 +60,23 @@ Este projeto utiliza **Taskipy** para gerenciar tarefas comuns de desenvolviment
     task fix
     ```
 
+*   **Ativar Pre-commit (Proteção de git):**
+    Garanta que o pre-commit esteja instalado para verificar seu código antes de cada commit.
+    ```bash
+    pre-commit install
+    ```
+
+## 🎧 Pipeline de Processamento de Áudio
+
+O projeto implementa um pipeline robusto para tratamento dos dados antes do treinamento:
+
+1.  **Denoising (Redução de Ruído)**: Aplicação de filtro High-Pass e redução de ruído estacionário para limpar o sinal bruto.
+2.  **Padding (Padronização)**: Todos os áudios são ajustados para ter exatamente 10 segundos (240.000 amostras a 24k Hz).
+3.  **Extração de Features**:
+    *   **Mel-Spectrograma**: Extraído do áudio limpo e padronizado.
+    *   **MFCC**: Calculado corretamente a partir do Mel-Spectrograma **bruto** (antes da normalização).
+4.  **Normalização**: Aplicação de Min-Max Scaling [0, 1] individualmente para cada feature antes de alimentar o modelo.
+
 ## 🤝 Workflow e Branches
 
 Para manter a organização e evitar conflitos, cada membro da equipe deve trabalhar em sua própria branch antes de enviar código para a `main`.
