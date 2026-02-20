@@ -13,7 +13,7 @@ def high_pass_filter(data, cutoff_freq, sample_rate, order):
     return y
 
 
-def denoise(data, sample_rate):
+def noise_reduce_denoise(data, sample_rate):
     reduced_noise = noisereduce.reduce_noise(y=data, sr=sample_rate)
 
     return reduced_noise
