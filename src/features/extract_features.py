@@ -3,14 +3,14 @@ import numpy as np
 
 
 def get_mel_spectrogram(signal, params):
-    mel_spectrogram = librosa.feature.melspectrogram(y=signal, **params)
+    mel = librosa.feature.melspectrogram(y=signal, **params)
 
-    log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+    log_mel = librosa.power_to_db(mel, ref=1.0)
 
-    return log_mel_spectrogram
+    return log_mel.astype(np.float32)
 
 
-def get_mfcc(log_mel_spectrogram, params):
-    mfccs = librosa.feature.mfcc(S=log_mel_spectrogram, **params)
+def get_mfcc(signal, params):
+    mfcc = librosa.feature.mfcc(y=signal, **params)
 
-    return mfccs
+    return mfcc.astype(np.float32)
