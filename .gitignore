@@ -1,0 +1,28 @@
+# Dados (Arquivos grandes de áudio/tabelas)
+*.wav
+*.mp3
+*.csv
+*.zip
+*.tar.gz
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Ferramentas
+.ruff_cache/
+.pytest_cache/
+.coverage
+
+# IDE / Sistema (Windows/Mac)
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

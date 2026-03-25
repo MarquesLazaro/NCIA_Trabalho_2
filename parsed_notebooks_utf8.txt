@@ -1,0 +1,1317 @@
+﻿
+
+======================= src/main.ipynb =======================
+
+[CODE]
+from pathlib import Path
+
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, precision_score, f1_score, confusion_matrix, recall_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import FunctionTransformer
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+
+from sklearn.metrics import accuracy_score, classification_report
+import noisereduce as nr
+
+from features.extract_features import get_mel_spectrogram, get_mfcc
+from models import DecisionTreeModel, LSTMModel, GRUModel
+from utils import min_max_scaler, pad_audio
+from denoise.denoise_methods import noise_reduce_denoise
+from scipy.signal import butter, sosfilt
+
+from torchmetrics import Accuracy, Precision, Recall, F1Score, ConfusionMatrix
+
+[CODE]
+print(torch.cuda.is_available())
+
+[CODE]
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+DCASE2024_ROOT_PATH = Path.cwd().parent / "data/raw/dcase-2024"
+
+DCASE2024_TRAIN_PATH = DCASE2024_ROOT_PATH / "Train"
+DCASE2024_DEV_PATH = DCASE2024_ROOT_PATH / "Dev"
+DCASE2024_EVAL_PATH = DCASE2024_ROOT_PATH / "Eval"
+
+DCASE2022_ROOT_PATH = Path.cwd().parent / "data/raw/dcase-2022"
+
+DCASE2022_TRAIN_PATH = DCASE2022_ROOT_PATH / "Train"
+DCASE2022_DEV_PATH = DCASE2022_ROOT_PATH / "Dev"
+
+# ===============================================================
+# ===============================================================
+
+SAMPLE_RATE = 16_000
+
+MEL_SPECTROGRAM_PARAMS = {
+    "n_fft": 1024,
+    "hop_length": 512,
+    "n_mels": 128,
+    "window": "hann",
+    "center": True,
+    "pad_mode": "reflect",
+    "power": 2.0,
+}
+
+MFCC_PARAMS = {
+    "n_mfcc": 20,
+    "n_fft": 1024,
+    "hop_length": 512,
+    "n_mels": 128,
+    "dct_type": 2,
+    "norm": "ortho",
+    "lifter": 0,
+}
+
+[CODE]
+def load_audio(audio):
+    signal, sample_rate = librosa.load(audio, mono=True, sr=SAMPLE_RATE)
+
+    return signal, sample_rate
+
+def pad_or_trim(signal, target_len):
+    if len(signal) > target_len:
+        return signal[:target_len]
+    elif len(signal) < target_len:
+        return np.pad(signal, (0, target_len - len(signal)), 'constant')
+   
+    return signal
+
+def rms_normalize(signal, target_rms=0.1, eps=1e-8):
+    rms = np.sqrt(np.mean(signal**2) + eps)
+    gain = target_rms / (rms + eps)
+
+    return (signal * gain).astype(np.float32)
+
+def peak_normalize(signal):
+    peak = np.max(np.abs(signal))
+    if peak > 0:
+        return signal / peak
+    return signal
+
+
+def preprocess_data(signals, padding_or_trim=True, denoise_method=None, normalize_method=None):
+    mel_features = []
+    mfcc_features = []
+    target_len = 10 * SAMPLE_RATE
+
+    for signal in signals:
+        if padding_or_trim:
+            signal = pad_or_trim(signal, target_len)
+        if denoise_method:
+            signal = denoise_method(signal)
+        if normalize_method:
+            signal = normalize_method(signal)
+        
+        mel = get_mel_spectrogram(signal, MEL_SPECTROGRAM_PARAMS)
+        mfcc = get_mfcc(signal, MFCC_PARAMS)
+
+        # norm_mel = min_max_scaler(mel)
+        # norm_mfcc = min_max_scaler(mfcc) 
+
+        mel_features.append(mel)
+        mfcc_features.append(mfcc)
+
+    return mel_features, mfcc_features
+
+def bandpass_filter(signal, sr=16000, low=80, high=7500, order=4):
+    nyq = 0.5 * sr
+    low_n = low / nyq
+    high_n = high / nyq
+    sos = butter(order, [low_n, high_n], btype="bandpass", output="sos")
+    return sosfilt(sos, signal).astype(np.float32)
+
+def spectral_gate(signal, sr=16000, noise_sec=0.25):
+    n = int(noise_sec * sr)
+    noise_clip = signal[:n]
+    return nr.reduce_noise(y=signal, y_noise=noise_clip, sr=sr).astype(np.float32)
+
+def highpass_filter(signal, sr=16000, cutoff=80, order=4):
+    nyq = 0.5 * sr
+    cutoff_n = cutoff / nyq
+    sos = butter(order, cutoff_n, btype="highpass", output="sos")
+    return sosfilt(sos, signal).astype(np.float32)
+
+[MD]
+# Leitura dos ßudios
+
+
+[CODE]
+def read_dcase_dev_set(path, ignore_machine_types=None, only_machine_type=None):
+    if ignore_machine_types is None:
+        ignore_machine_types = []
+
+    X_train, y_train, mtype_train = [], [], []
+    X_test, y_test, mtype_test = [], [], []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        mtype = machine_dir.name
+        if mtype in ignore_machine_types:
+            continue
+
+        if only_machine_type is not None and mtype != only_machine_type:
+            continue
+
+        for section in ["train", "test"]:
+            data_dir = machine_dir / section
+            if not data_dir.exists():
+                continue
+
+            wavs = list(data_dir.glob("*.wav"))
+            for audio_file in tqdm(wavs, desc=f"{mtype} - {section}"):
+                try:
+                    signal, _ = load_audio(str(audio_file))
+
+                    if section == "train":
+                        label = 0
+                        X_train.append(signal)
+                        y_train.append(label)
+                        mtype_train.append(mtype)
+
+                    else:
+                        label = 1 if "anomaly" in audio_file.name.lower() else 0
+                        X_test.append(signal)
+                        y_test.append(label)
+                        mtype_test.append(mtype)
+
+                except Exception as e:
+                    print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X_train, X_test, y_train, y_test, mtype_train, mtype_test
+
+
+def read_dcase_train_set(path):
+    X = []
+    machine_type = []
+    y = []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        data_dir = machine_dir / "train"
+        if not data_dir.exists():
+            continue
+
+        for audio_file in tqdm(data_dir.iterdir(), desc="Lendo train"):
+            if audio_file.suffix != ".wav":
+                continue
+            try:
+                label = 0
+
+                signal, _ = load_audio(audio_file)
+
+                X.append(signal)
+                machine_type.append(machine_dir.name)
+                y.append(label)
+
+            except Exception as e:
+                print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X, machine_type, y
+
+
+def read_dcase_eval_set(path):
+    X = []
+    machine_type = []
+    y = []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        data_dir = machine_dir / "test"
+        if not data_dir.exists():
+            continue
+
+        for audio_file in tqdm(data_dir.iterdir(), desc="Lendo eval"):
+            if audio_file.suffix != ".wav":
+                continue
+            try:
+                if "anomaly" in audio_file.name:
+                    label = 1
+                else:
+                    label = 0
+
+                signal, _ = load_audio(audio_file)
+
+                X.append(signal)
+                machine_type.append(machine_dir.name)
+                y.append(label)
+
+            except Exception as e:
+                print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X, machine_type, y
+
+[CODE]
+def read_dcase_dev_set(path, ignore_machine_types=None, only_machine_type=None):
+    if ignore_machine_types is None:
+        ignore_machine_types = []
+
+    X, machine_type, y, sections = [], [], [], []
+
+    for machine_dir in path.iterdir():
+        if not machine_dir.is_dir():
+            continue
+            
+        if machine_dir.name in ignore_machine_types:
+            continue
+            
+        if only_machine_type and machine_dir.name != only_machine_type:
+            continue
+
+        for audio_file in machine_dir.rglob('*.wav'):
+            try:
+                # O nome do ficheiro Ú ex: "section_00_source_train_normal_0000.wav"
+                # Vamos extrair "section_00"
+                file_parts = audio_file.name.split('_')
+                section_name = f"{file_parts[0]}_{file_parts[1]}"
+                
+                label = 1 if 'anomaly' in audio_file.name else 0
+
+                signal, _ = load_audio(audio_file)
+                
+                X.append(signal)
+                machine_type.append(machine_dir.name)
+                y.append(label)
+                sections.append(section_name)
+
+            except Exception as e:
+                print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X, machine_type, y, sections
+
+[CODE]
+X_all, mtypes_all, y_all, sections_all = read_dcase_dev_set(
+    DCASE2022_DEV_PATH, 
+    only_machine_type='fan'
+)
+
+print(f"Seþ§es encontradas: {np.unique(sections_all)}")
+
+train_section = ['section_00', 'section_01']
+test_section = ['section_02']
+
+X_train, y_train = [], []
+X_test, y_test = [], []
+
+for i in range(len(X_all)):
+    sec = sections_all[i]
+    
+    if sec in train_section:
+        X_train.append(X_all[i])
+        y_train.append(y_all[i])
+    elif sec in test_section:
+        X_test.append(X_all[i])
+        y_test.append(y_all[i])
+
+print("=" * 45)
+print(f"Tamanho do Treino (Seþ§es {train_section}): {len(X_train)} amostras")
+print(f"Tamanho do Teste (Seþ§es {test_section}): {len(X_test)} amostras")
+print("=" * 45)
+
+[CODE]
+class MachineAudioDataset(Dataset):
+    def __init__(self, features, labels):
+       self.features = features
+       self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feature = self.features[idx]
+        label = self.labels[idx]
+
+        return (torch.tensor(feature, dtype=torch.float32),
+                torch.tensor(label, dtype=torch.long))
+
+[CODE]
+def train(model, optimizer, criterion, train_loader, epochs):
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        total_n = 0
+
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device, dtype=torch.float32)
+            y_batch = y_batch.to(device, dtype=torch.long)
+
+            optimizer.zero_grad()
+
+            logits = model(X_batch)
+            loss = criterion(logits, y_batch)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            bs = X_batch.size(0)
+            total_loss += loss.item() * bs
+            total_n += bs
+
+        mean_loss = total_loss / max(1, total_n)
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {mean_loss:.4f}")
+
+@torch.no_grad()
+def evaluate(model, data_loader, num_classes=2):
+    model.eval()
+
+    acc_metric = Accuracy(task="multiclass", num_classes=num_classes).to(device)
+    prec_metric = Precision(task="multiclass", num_classes=num_classes, average="macro").to(device)
+    rec_metric = Recall(task="multiclass", num_classes=num_classes, average="macro").to(device)
+    f1_metric = F1Score(task="multiclass", num_classes=num_classes, average="macro").to(device)
+    cm_metric = ConfusionMatrix(task="multiclass", num_classes=num_classes).to(device)
+
+    for X_batch, y_batch in data_loader:
+        X_batch = X_batch.to(device, dtype=torch.float32)  # (B, T, C)
+        y_batch = y_batch.to(device, dtype=torch.long)
+
+        logits = model(X_batch)
+
+        acc_metric.update(logits, y_batch)
+        prec_metric.update(logits, y_batch)
+        rec_metric.update(logits, y_batch)
+        f1_metric.update(logits, y_batch)
+        cm_metric.update(logits, y_batch)
+
+    acc = acc_metric.compute().item()
+    prec = prec_metric.compute().item()
+    rec = rec_metric.compute().item()
+    f1 = f1_metric.compute().item()
+    cm = cm_metric.compute().detach().cpu().numpy()
+
+    acc_metric.reset(); prec_metric.reset(); rec_metric.reset(); f1_metric.reset(); cm_metric.reset()
+    return acc, prec, rec, f1, cm
+
+[CODE]
+def to_time_major(feat_ct: np.ndarray) -> np.ndarray:
+    return feat_ct.T.astype(np.float32)
+
+def fit_zscore(train_feats_tc: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    all_frames = np.concatenate(train_feats_tc, axis=0)  # (sum_T, C)
+    mean = all_frames.mean(axis=0).astype(np.float32)
+    std = (all_frames.std(axis=0) + 1e-8).astype(np.float32)
+    return mean, std
+
+def apply_zscore(feats_tc: list[np.ndarray], mean: np.ndarray, std: np.ndarray) -> list[np.ndarray]:
+    out = []
+    for x in feats_tc:
+        out.append(((x - mean) / std).astype(np.float32))
+    return out
+
+[CODE]
+train_mel, train_mfcc = preprocess_data(X_train, denoise_method=bandpass_filter, normalize_method=peak_normalize)
+test_mel,  test_mfcc  = preprocess_data(X_test,  denoise_method=bandpass_filter, normalize_method=peak_normalize)
+
+train_mel  = [to_time_major(m) for m in train_mel]
+test_mel   = [to_time_major(m) for m in test_mel]
+
+train_mfcc = [to_time_major(m) for m in train_mfcc]
+test_mfcc  = [to_time_major(m) for m in test_mfcc]
+
+mean_mel, std_mel = fit_zscore(train_mel)
+train_mel = apply_zscore(train_mel, mean_mel, std_mel)
+test_mel  = apply_zscore(test_mel,  mean_mel, std_mel)
+
+mean_mfcc, std_mfcc = fit_zscore(train_mfcc)
+train_mfcc = apply_zscore(train_mfcc, mean_mfcc, std_mfcc)
+test_mfcc  = apply_zscore(test_mfcc,  mean_mfcc, std_mfcc)
+
+train_mel  = torch.tensor(train_mel,  dtype=torch.float32)
+train_mfcc = torch.tensor(train_mfcc, dtype=torch.float32)
+test_mel   = torch.tensor(test_mel,   dtype=torch.float32)
+test_mfcc  = torch.tensor(test_mfcc,  dtype=torch.float32)
+
+[CODE]
+lr = 0.001
+epochs = 30
+features_set = "mel"
+
+if features_set == "mel":
+    train_features = train_mel
+    test_features = test_mel
+elif features_set == "mfcc":
+    train_features = train_mfcc
+    test_features = test_mfcc
+elif features_set == "combine":
+    train_features = torch.cat([train_mel, train_mfcc], dim=2)
+    test_features  = torch.cat([test_mel,  test_mfcc],  dim=2)
+else:
+    raise ValueError("features_set invßlido")
+
+input_size = train_features.shape[2] 
+
+train_dataset = MachineAudioDataset(train_features, y_train)
+test_dataset  = MachineAudioDataset(test_features,  y_test)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False)
+
+class_weights = torch.tensor([1.0, 1.0]).to(device)
+
+model = GRUModel(input_size).to(device)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+optimizer = optim.Adam(model.parameters(), lr=lr)
+
+train(model, optimizer, criterion, train_loader, epochs)
+
+[CODE]
+acc, prec, rec, f1, cm = evaluate(model, test_loader)
+
+print("=" * 80)
+print(f"Acuracia: {acc:.2%}")
+print(f"Precisao: {prec:.2%}")
+print(f"Revocacao: {rec:.2%}")
+print(f"F1: {f1:.2%}")
+print(f"Matriz de confusÒo: \n{cm}")
+print("=" * 80)
+
+[CODE]
+# train_mel, train_mfcc = np.array(train_mel), np.array(train_mfcc)
+# test_mel, test_mfcc = np.array(test_mel), np.array(test_mfcc)
+ 
+# features_set = 'mfcc'
+
+# if features_set == 'mel':
+#     train_features = train_mel
+#     test_features = test_mel
+# elif features_set == 'mfcc':
+#     train_features = train_mfcc
+#     test_features = test_mfcc
+# elif features_set == 'combine':
+#     train_features = np.concatenate([train_mel, train_mfcc], axis=-1)
+#     test_features = np.concatenate([test_mel, test_mfcc], axis=-1)
+
+# train_features = np.mean(train_features, axis=1)
+# test_features = np.mean(test_features, axis=1)
+
+# input_size = train_features[0].shape[0]
+
+# model = DecisionTreeModel(random_state=42)
+# model.fit(train_features, y_train)
+
+# y_pred = model.predict(test_features)
+
+# print(f"Acuracia: {accuracy_score(y_test, y_pred):.2%}")
+# print(f"Precisao: {precision_score(y_test, y_pred):.2%}")
+# print(f"Revocacao: {recall_score(y_test, y_pred):.2%}")
+# print(f"F1: {f1_score(y_test, y_pred):.2%}")
+# #print(f"Matriz de confusao: {confusion_matrix(y_test, y_pred):.2%}")
+
+
+======================= src/main2.ipynb =======================
+
+[CODE]
+import os
+from pathlib import Path
+import numpy as np
+import librosa
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import scipy.stats
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+import shap
+from sklearn.model_selection import train_test_split, ParameterGrid
+from scipy.signal import butter, sosfilt
+
+[CODE]
+# =====================================================================
+# 1. PAR┬METROS
+# =====================================================================
+SAMPLE_RATE = 16_000
+
+DCASE2022_DEV_PATH = Path(r"C:\Users\josel\OneDrive\Desktop\NCIA\data\raw\dcase-2024\Dev") 
+MACHINE_TYPE = 'fan'
+TARGET_SECTION = 'section_00'
+
+[CODE]
+# =====================================================================
+# 2. TRATAMENTO DE ┴UDIO E FEATURE EXTRACTION
+# =====================================================================
+# --- Funþ§es de Limpeza de ┴udio ---
+def highpass_filter(signal, sr=16000, cutoff=80, order=4):
+    nyq = 0.5 * sr
+    cutoff_n = cutoff / nyq
+    sos = butter(order, cutoff_n, btype="highpass", output="sos")
+    return sosfilt(sos, signal).astype(np.float32)
+
+def peak_normalize(signal):
+    peak = np.max(np.abs(signal))
+    if peak > 0:
+        return signal / peak
+    return signal
+
+def extract_features(file_path):
+    signal, sr = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
+    
+    #signal = highpass_filter(signal) 
+    # signal = peak_normalize(signal) 
+    
+    rms = np.sqrt(np.mean(signal**2))
+    kurt = scipy.stats.kurtosis(signal)
+    skew = scipy.stats.skew(signal)
+    p2p = np.ptp(signal) 
+    crest = np.max(np.abs(signal)) / (rms + 1e-8) 
+    mean_val = np.mean(signal)
+    std_val = np.std(signal)
+    
+    hist, _ = np.histogram(signal, bins=256, density=True)
+    hist = hist[hist > 0]
+    entropy = scipy.stats.entropy(hist)
+
+    mfccs = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=32)
+    mel_spec = librosa.feature.melspectrogram(y=signal, sr=sr, n_mels=32)
+    mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+   
+    mfccs_mean = np.mean(mfccs, axis=1)
+    mfccs_std = np.std(mfccs, axis=1) 
+    mel_mean = np.mean(mel_db, axis=1)
+    basic_features = np.array([rms, kurt, skew, p2p, crest, mean_val, std_val, entropy]) 
+    
+    return np.concatenate([basic_features, mfccs_mean])
+    
+    # return basic_features
+
+[CODE]
+# =====================================================================
+# 3. LEITURA E SEPARAÃ├O DOS DADOS
+# =====================================================================
+print(f"Lendo dados da mßquina '{MACHINE_TYPE}' - SeþÒo '{TARGET_SECTION}'...")
+
+X_train_raw, y_train_raw = [], []
+X_test_all, y_test_all = [], []
+feature_names = ["RMS", "Kurtosis", "Skewness", "Peak-to-Peak", "Crest_Factor", "Mean", "Std", "Entropy"]
+machine_dir = DCASE2022_DEV_PATH / MACHINE_TYPE
+
+for f in tqdm(list((machine_dir / 'train').rglob('*.wav')), desc="Extraindo Treino"):
+    if TARGET_SECTION in f.name:
+        X_train_raw.append(extract_features(f))
+        y_train_raw.append(0)
+
+for f in tqdm(list((machine_dir / 'test').rglob('*.wav')), desc="Extraindo AvaliaþÒo"):
+    if TARGET_SECTION in f.name:
+        X_test_all.append(extract_features(f))
+        label = 1 if 'anomaly' in f.name else 0
+        y_test_all.append(label)
+
+X_train_raw = np.array(X_train_raw)
+y_train_raw = np.array(y_train_raw)
+
+X_val_raw, X_test_raw, y_val, y_test = train_test_split(
+    X_test_all, y_test_all, test_size=0.7, random_state=42, stratify=y_test_all
+)
+
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_raw)
+X_val_scaled = scaler.transform(X_val_raw)
+X_test_scaled = scaler.transform(X_test_raw)
+
+[CODE]
+# =====================================================================
+# 4. EXHAUSTIVE GRID SEARCH (No Conjunto de ValidaþÒo)
+# =====================================================================
+print("\n" + "="*50)
+print("INICIANDO FINE-TUNING DE HIPERPAR┬METROS")
+print("="*50)
+
+# --- ESPAÃO DE BUSCA OCSVM (90 combinaþ§es) ---
+param_grid_ocsvm = {
+    'nu': [0.001, 0.01, 0.05, 0.1, 0.2],
+    'gamma': ['scale', 'auto', 0.001, 0.01, 0.1, 0.5],
+    'kernel': ['rbf', 'poly', 'sigmoid']
+}
+
+best_auc_ocsvm = 0
+best_ocsvm = None
+best_params_ocsvm = {}
+
+grid_ocsvm = list(ParameterGrid(param_grid_ocsvm))
+print(f"Testando {len(grid_ocsvm)} combinaþ§es para o One-Class SVM...")
+
+for params in tqdm(grid_ocsvm, desc="OCSVM Grid"):
+    ocsvm = OneClassSVM(**params)
+    ocsvm.fit(X_train_scaled)
+    scores_val = -ocsvm.decision_function(X_val_scaled)
+    auc_val = roc_auc_score(y_val, scores_val)
+    
+    if auc_val > best_auc_ocsvm:
+        best_auc_ocsvm = auc_val
+        best_ocsvm = ocsvm
+        best_params_ocsvm = params
+
+print(f"-> Melhor OCSVM AUC-Val: {best_auc_ocsvm:.2%} | Params: {best_params_ocsvm}")
+
+# --- ESPAÃO DE BUSCA ISOLATION FOREST (216 combinaþ§es) ---
+param_grid_if = {
+    'n_estimators': [100, 300, 500, 1000, 10000],
+    'max_samples': ['auto', 0.5, 0.8],
+    'contamination': ['auto', 0.01, 0.05, 0.1, 0.15, 0.2],
+    'max_features': [0.5, 0.8, 1.0]
+}
+
+best_auc_if = 0
+best_iforest = None
+best_params_if = {}
+
+grid_if = list(ParameterGrid(param_grid_if))
+print(f"\nTestando {len(grid_if)} combinaþ§es para o Isolation Forest...")
+
+for params in tqdm(grid_if, desc="iForest Grid"):
+    iforest = IsolationForest(**params, random_state=42)
+    iforest.fit(X_train_scaled)
+    scores_val = -iforest.decision_function(X_val_scaled)
+    auc_val = roc_auc_score(y_val, scores_val)
+    
+    if auc_val > best_auc_if:
+        best_auc_if = auc_val
+        best_iforest = iforest
+        best_params_if = params
+
+print(f"-> Melhor Isolation Forest AUC-Val: {best_auc_if:.2%} | Params: {best_params_if}")
+
+[CODE]
+# =====================================================================
+# 5. TESTE FINAL
+# =====================================================================
+print("\n" + "="*50)
+print("AVALIAÃ├O NO CONJUNTO DE TESTE FINAL (INTOCADO)")
+print("="*50)
+
+# --- Teste do OCSVM ---
+scores_test_ocsvm = -best_ocsvm.decision_function(X_test_scaled)
+preds_test_ocsvm = [1 if x == -1 else 0 for x in best_ocsvm.predict(X_test_scaled)]
+auc_test_ocsvm = roc_auc_score(y_test, scores_test_ocsvm)
+
+print(f"\n[1] RESULTADOS: best One-Class SVM")
+print(f"ROC-AUC Teste: {auc_test_ocsvm:.2%}")
+print("Relat¾rio de ClassificaþÒo:")
+print(classification_report(y_test, preds_test_ocsvm, target_names=['Normal (0)', 'Anomalia (1)'], zero_division=0))
+
+# --- Teste do Isolation Forest ---
+scores_test_if = -best_iforest.decision_function(X_test_scaled)
+preds_test_if = [1 if x == -1 else 0 for x in best_iforest.predict(X_test_scaled)]
+auc_test_if = roc_auc_score(y_test, scores_test_if)
+
+print(f"\n[2] RESULTADOS: Melhor Isolation Forest")
+print(f"ROC-AUC Teste: {auc_test_if:.2%}")
+print("Relat¾rio de ClassificaþÒo:")
+print(classification_report(y_test, preds_test_if, target_names=['Normal (0)', 'Anomalia (1)'], zero_division=0))
+
+# =====================================================================
+# 6. MATRIZES DE CONFUS├O VISUAIS
+# =====================================================================
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+cm_ocsvm = confusion_matrix(y_test, preds_test_ocsvm)
+sns.heatmap(cm_ocsvm, annot=True, fmt='d', cmap='Blues', ax=axes[0], xticklabels=['Normal', 'Anomalia'], yticklabels=['Normal', 'Anomalia'])
+axes[0].set_title(f'Matriz de ConfusÒo OCSVM')
+
+cm_if = confusion_matrix(y_test, preds_test_if)
+sns.heatmap(cm_if, annot=True, fmt='d', cmap='Oranges', ax=axes[1], xticklabels=['Normal', 'Anomalia'], yticklabels=['Normal', 'Anomalia'])
+axes[1].set_title(f'Matriz de ConfusÒo Isolation Forest')
+
+plt.tight_layout()
+plt.show()
+
+[CODE]
+# =====================================================================
+# 7. EXPLICABILIDADE AVANÃADA COM SHAP
+# =====================================================================
+print("\n--- Gerando Explicabilidade (SHAP) para o Isolation Forest---")
+explainer = shap.TreeExplainer(best_iforest)
+shap_values = explainer.shap_values(X_test_scaled)
+
+plt.figure(figsize=(10, 6))
+plt.title(f"Impacto das Features (SHAP Summary Plot)")
+sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+shap.summary_plot(sv, X_test_scaled, feature_names=feature_names)
+
+
+======================= src/main3.ipynb =======================
+
+[CODE]
+from pathlib import Path
+
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, precision_score, f1_score, confusion_matrix, recall_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import FunctionTransformer
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+
+from sklearn.metrics import accuracy_score, classification_report
+from scipy.signal import butter, sosfilt
+
+from torchmetrics import Accuracy, Precision, Recall, F1Score, ConfusionMatrix
+
+[CODE]
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+DCASE2024_ROOT_PATH = Path.cwd().parent / "data/raw/dcase-2024"
+
+DCASE2024_TRAIN_PATH = DCASE2024_ROOT_PATH / "Train"
+DCASE2024_DEV_PATH = DCASE2024_ROOT_PATH / "Dev"
+DCASE2024_EVAL_PATH = DCASE2024_ROOT_PATH / "Eval"
+
+DCASE2022_ROOT_PATH = Path.cwd().parent / "data/raw/dcase-2022"
+
+DCASE2022_TRAIN_PATH = DCASE2022_ROOT_PATH / "Train"
+DCASE2022_DEV_PATH = DCASE2022_ROOT_PATH / "Dev"
+
+# ===============================================================
+# ===============================================================
+
+SAMPLE_RATE = 16_000
+MEL_SPECTROGRAM_PARAMS = {
+    "n_fft": 1024,
+    "hop_length": 512,
+    "n_mels": 128,
+    "window": "hann",
+    "center": True,
+    "pad_mode": "reflect",
+    "power": 2.0,
+}
+
+MFCC_PARAMS = {
+    "n_mfcc": 128,
+    "n_fft": 1024,
+    "hop_length": 512,
+    "n_mels": 128,
+    "dct_type": 2,
+    "norm": "ortho",
+    "lifter": 0,
+}
+
+device
+
+[CODE]
+import librosa
+import numpy as np
+
+
+def get_mel_spectrogram(signal, params):
+    mel = librosa.feature.melspectrogram(y=signal, **params)
+
+    log_mel = librosa.power_to_db(mel, ref=np.max)
+
+    return log_mel.astype(np.float32)
+
+
+def get_mfcc(signal, params):
+    mfcc = librosa.feature.mfcc(y=signal, **params)
+
+    return mfcc.astype(np.float32)
+
+[CODE]
+def load_audio(audio):
+    signal, sample_rate = librosa.load(audio, mono=True, sr=SAMPLE_RATE)
+
+    return signal, sample_rate
+
+def pad_or_trim(signal, target_len):
+    if len(signal) > target_len:
+        return signal[:target_len]
+    elif len(signal) < target_len:
+        return np.pad(signal, (0, target_len - len(signal)), 'constant')
+
+    return signal
+
+def rms_normalize(signal, target_rms=0.1, eps=1e-8):
+    rms = np.sqrt(np.mean(signal**2) + eps)
+    gain = target_rms / (rms + eps)
+
+    return (signal * gain).astype(np.float32)
+
+def peak_normalize(signal):
+    peak = np.max(np.abs(signal))
+    if peak > 0:
+        return signal / peak
+    return signal
+
+
+def preprocess_data(signals, padding_or_trim=True, denoise_method=None, normalize_method=None):
+    mel_features = []
+    mfcc_features = []
+    target_len = 10 * SAMPLE_RATE
+
+    for signal in signals:
+        if padding_or_trim:
+            signal = pad_or_trim(signal, target_len)
+        if denoise_method:
+            signal = denoise_method(signal)
+        if normalize_method:
+            signal = normalize_method(signal)
+
+        mel = get_mel_spectrogram(signal, MEL_SPECTROGRAM_PARAMS)
+        mfcc = get_mfcc(signal, MFCC_PARAMS)
+
+        # norm_mel = min_max_scaler(mel)
+        # norm_mfcc = min_max_scaler(mfcc)
+
+        mel_features.append(mel)
+        mfcc_features.append(mfcc)
+
+    return mel_features, mfcc_features
+
+def bandpass_filter(signal, sr=16000, low=80, high=7500, order=4):
+    nyq = 0.5 * sr
+    low_n = low / nyq
+    high_n = high / nyq
+    sos = butter(order, [low_n, high_n], btype="bandpass", output="sos")
+    return sosfilt(sos, signal).astype(np.float32)
+
+def spectral_gate(signal, sr=16000, noise_sec=0.25):
+    n = int(noise_sec * sr)
+    noise_clip = signal[:n]
+    return nr.reduce_noise(y=signal, y_noise=noise_clip, sr=sr).astype(np.float32)
+
+def highpass_filter(signal, sr=16000, cutoff=80, order=4):
+    nyq = 0.5 * sr
+    cutoff_n = cutoff / nyq
+    sos = butter(order, cutoff_n, btype="highpass", output="sos")
+    return sosfilt(sos, signal).astype(np.float32)
+
+[MD]
+# Leitura dos ßudios
+
+
+[CODE]
+def read_dcase_dev_set(path, ignore_machine_types=None, only_machine_type=None):
+    if ignore_machine_types is None:
+        ignore_machine_types = []
+
+    X_train, y_train, mtype_train = [], [], []
+    X_test, y_test, mtype_test = [], [], []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        mtype = machine_dir.name
+        if mtype in ignore_machine_types:
+            continue
+
+        if only_machine_type is not None and mtype != only_machine_type:
+            continue
+
+        for section in ["train", "test"]:
+            data_dir = machine_dir / section
+            if not data_dir.exists():
+                continue
+
+            wavs = list(data_dir.glob("*.wav"))
+            for audio_file in tqdm(wavs, desc=f"{mtype} - {section}"):
+                try:
+                    signal, _ = load_audio(str(audio_file))
+
+                    if section == "train":
+                        label = 0
+                        X_train.append(signal)
+                        y_train.append(label)
+                        mtype_train.append(mtype)
+
+                    else:
+                        label = 1 if "anomaly" in audio_file.name.lower() else 0
+                        X_test.append(signal)
+                        y_test.append(label)
+                        mtype_test.append(mtype)
+
+                except Exception as e:
+                    print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X_train, X_test, y_train, y_test, mtype_train, mtype_test
+
+
+def read_dcase_train_set(path):
+    X = []
+    machine_type = []
+    y = []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        data_dir = machine_dir / "train"
+        if not data_dir.exists():
+            continue
+
+        for audio_file in tqdm(data_dir.iterdir(), desc="Lendo train"):
+            if audio_file.suffix != ".wav":
+                continue
+            try:
+                label = 0
+
+                signal, _ = load_audio(audio_file)
+
+                X.append(signal)
+                machine_type.append(machine_dir.name)
+                y.append(label)
+
+            except Exception as e:
+                print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X, machine_type, y
+
+
+def read_dcase_eval_set(path):
+    X = []
+    machine_type = []
+    y = []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        data_dir = machine_dir / "test"
+        if not data_dir.exists():
+            continue
+
+        for audio_file in tqdm(data_dir.iterdir(), desc="Lendo eval"):
+            if audio_file.suffix != ".wav":
+                continue
+            try:
+                if "anomaly" in audio_file.name:
+                    label = 1
+                else:
+                    label = 0
+
+                signal, _ = load_audio(audio_file)
+
+                X.append(signal)
+                machine_type.append(machine_dir.name)
+                y.append(label)
+
+            except Exception as e:
+                print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X, machine_type, y
+
+[CODE]
+def read_dcase_dev_set(path, ignore_machine_types=None, only_machine_type=None, only_section=None, ignore_target_domain=True):
+    if ignore_machine_types is None:
+        ignore_machine_types = []
+
+    X_train, y_train, mtype_train, section_train = [], [], [], []
+    X_test, y_test, mtype_test, section_test = [], [], [], []
+
+    for machine_dir in Path(path).iterdir():
+        if not machine_dir.is_dir():
+            continue
+
+        mtype = machine_dir.name
+        if mtype in ignore_machine_types:
+            continue
+
+        if only_machine_type is not None and mtype != only_machine_type:
+            continue
+
+        for section_folder in ["train", "test"]:
+            data_dir = machine_dir / section_folder
+            if not data_dir.exists():
+                continue
+
+            wavs = list(data_dir.glob("*.wav"))
+            for audio_file in tqdm(wavs, desc=f"{mtype} - {section_folder}"):
+
+                # --- NOVA VERIFICAÃ├O: IGNORAR TARGET DOMAIN ---
+                if ignore_target_domain and "target" in audio_file.name.lower():
+                    continue
+
+                try:
+                    # Extrai a seþÒo do nome do arquivo
+                    parts = audio_file.name.split('_')
+                    if 'section' in parts:
+                        idx = parts.index('section')
+                        section_id = f"section_{parts[idx+1]}"
+                    else:
+                        section_id = "unknown"
+
+                    # Se vocÛ especificou uma seþÒo e ela for diferente da atual, pula este ßudio
+                    if only_section is not None and section_id != only_section:
+                        continue
+
+                    signal, _ = load_audio(str(audio_file))
+
+                    if section_folder == "train":
+                        label = 0
+                        X_train.append(signal)
+                        y_train.append(label)
+                        mtype_train.append(mtype)
+                        section_train.append(section_id)
+
+                    else:
+                        label = 1 if "anomaly" in audio_file.name.lower() else 0
+                        X_test.append(signal)
+                        y_test.append(label)
+                        mtype_test.append(mtype)
+                        section_test.append(section_id)
+
+                except Exception as e:
+                    print(f"Erro ao processar {audio_file.name}: {e}")
+
+    return X_train, X_test, y_train, y_test, mtype_train, mtype_test, section_train, section_test
+
+[CODE]
+signals_train, signals_test, labels_train, labels_test, mtype_train, mtype_test, sec_train, sec_test = read_dcase_dev_set(
+    DCASE2022_DEV_PATH,
+    only_machine_type='gearbox',
+    only_section='section_00'
+)
+print()
+print('=' * 45)
+print('Leitura ConcluÝda!')
+print(f'Total de amostras: {len(signals_train) + len(signals_test)}')
+print(f'Amostras de treino: {len(signals_train)}')
+print(f'Amostras de testes: {len(signals_test)}')
+print(f'Mßquinas de treino: {np.unique(mtype_train)}')
+print(f'Mßquinas de teste: {np.unique(mtype_test)}')
+print('=' * 45)
+print()
+
+[CODE]
+class MachineAudioDataset(Dataset):
+    def __init__(self, features, labels):
+       self.features = features
+       self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feature = self.features[idx]
+        label = self.labels[idx]
+
+        return (torch.tensor(feature, dtype=torch.float32),
+                torch.tensor(label, dtype=torch.long))
+
+[CODE]
+def to_time_major(feat_ct: np.ndarray) -> np.ndarray:
+    return feat_ct.T.astype(np.float32)
+
+def fit_zscore(train_feats_tc: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    all_frames = np.concatenate(train_feats_tc, axis=0)  # (sum_T, C)
+    mean = all_frames.mean(axis=0).astype(np.float32)
+    std = (all_frames.std(axis=0) + 1e-8).astype(np.float32)
+    return mean, std
+
+def apply_zscore(feats_tc: list[np.ndarray], mean: np.ndarray, std: np.ndarray) -> list[np.ndarray]:
+    out = []
+    for x in feats_tc:
+        out.append(((x - mean) / std).astype(np.float32))
+    return out
+
+[CODE]
+import torch
+import torch.nn as nn
+
+class CNNAutoencoder(nn.Module):
+    def __init__(self):
+        super(CNNAutoencoder, self).__init__()
+        
+        # ENCODER: CompressÒo Espacial
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(),
+        )
+        
+        # GARGALO REAL (BOTTLENECK): Forþa a rede a comprimir tudo em 256 valores
+        self.fc1 = nn.Linear(128 * 20 * 8, 256) 
+        self.fc2 = nn.Linear(256, 128 * 20 * 8)
+
+        # DECODER: ReconstruþÒo
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(32), nn.ReLU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1), 
+            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.ConvTranspose2d(16, 1, kernel_size=3, stride=2, padding=1, output_padding=1),
+        )
+
+    def forward(self, x):
+        x = x.unsqueeze(1) 
+        original_shape = x.shape
+        
+        # Passa pela CNN
+        encoded = self.encoder(x)
+        conv_shape = encoded.shape 
+        
+        # Achata e passa pelo Gargalo
+        encoded_flat = encoded.view(encoded.size(0), -1)
+        bottleneck = torch.relu(self.fc1(encoded_flat))
+        decoded_flat = torch.relu(self.fc2(bottleneck))
+        
+        # Desachata e passa pelo Decoder
+        decoded_reshaped = decoded_flat.view(encoded.size(0), conv_shape[1], conv_shape[2], conv_shape[3])
+        decoded = self.decoder(decoded_reshaped)
+        
+        decoded = decoded[:, :, :original_shape[2], :original_shape[3]]
+        return decoded.squeeze(1)
+
+[CODE]
+sec_unique = sorted(list(set(sec_train)))
+sec_to_idx = {s:i for i,s in enumerate(sec_unique)}
+y_train_section = np.array([sec_to_idx[s] for s in sec_train], dtype=np.int64)
+
+y_test_anom = np.array(labels_test, dtype=np.int64)  
+
+train_mel, train_mfcc = preprocess_data(signals_train, denoise_method=None, normalize_method=peak_normalize)
+test_mel,  test_mfcc  = preprocess_data(signals_test,  denoise_method=None, normalize_method=peak_normalize)
+
+train_mel = [to_time_major(m) for m in train_mel]  # (T, C)
+test_mel  = [to_time_major(m) for m in test_mel]
+
+mean, std = fit_zscore(train_mel)
+train_mel = [apply_zscore(x, mean, std) for x in train_mel]
+test_mel  = [apply_zscore(x, mean, std) for x in test_mel]
+
+train_features = train_mel
+test_features = test_mel
+
+[CODE]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SectionCNN(nn.Module):
+    def __init__(self, n_sections: int, embed_dim: int = 256):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, 1, 1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_emb = nn.Linear(256, embed_dim)
+        self.fc_cls = nn.Linear(embed_dim, n_sections)
+
+    def forward(self, x):
+        # x: (B, T, C)
+        x = x.unsqueeze(1)  # (B, 1, T, C)
+        z = self.net(x)
+        z = self.pool(z).flatten(1)
+        emb = self.fc_emb(z)
+        emb = F.normalize(emb, dim=1)
+        logits = self.fc_cls(emb)
+        return logits, emb
+
+[CODE]
+from torch.utils.data import Dataset, DataLoader
+
+train_ds = MachineAudioDataset(train_features, y_train_section)
+test_ds  = MachineAudioDataset(test_features, y_test_anom)  # labels de anomalia s¾ para AUC
+
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+test_loader  = DataLoader(test_ds,  batch_size=32, shuffle=False)
+
+[CODE]
+n_sections = len(sec_unique)
+model = SectionCNN(n_sections=n_sections, embed_dim=256).to(device)
+
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+epochs = 25
+for epoch in range(1, epochs + 1):
+    model.train()
+    losses = []
+    correct = 0
+    total = 0
+
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        opt.zero_grad(set_to_none=True)
+        logits, _ = model(x)
+        loss = F.cross_entropy(logits, y)
+        loss.backward()
+        opt.step()
+
+        losses.append(loss.item())
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+
+    print(f"epoch {epoch:02d} loss {np.mean(losses):.4f} acc {correct/max(total,1):.3f}")
+
+[CODE]
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import roc_auc_score
+
+@torch.no_grad()
+def get_embeddings(loader):
+    model.eval()
+    embs = []
+    labels = []
+    for x, y in loader:
+        x = x.to(device)
+        _logits, emb = model(x)
+        embs.append(emb.cpu().numpy())
+        labels.append(y.numpy())
+    return np.concatenate(embs, axis=0), np.concatenate(labels, axis=0)
+
+train_embs, _ = get_embeddings(train_loader)     # s¾ normal
+test_embs, y_test = get_embeddings(test_loader)  # y_test Ú 0 normal, 1 anomaly
+
+knn = NearestNeighbors(n_neighbors=5, metric="cosine")
+knn.fit(train_embs)
+
+dists, _ = knn.kneighbors(test_embs)
+scores = dists.mean(axis=1)
+
+auc = roc_auc_score(y_test, scores)
+print("AUC:", auc)
